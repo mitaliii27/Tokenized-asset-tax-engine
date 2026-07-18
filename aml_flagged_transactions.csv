@@ -1,0 +1,51 @@
+{
+  "etl": {
+    "rows_ingested": 57839,
+    "duplicate_rows_dropped": 0,
+    "rows_rejected_quality_gate": 404,
+    "rows_loaded_gold": 57435,
+    "data_quality_pass_rate": 0.993,
+    "silver_path": "data/silver_transactions",
+    "gold_sql_path": "data/warehouse.db"
+  },
+  "fpna": {
+    "months_covered": 14,
+    "asset_classes": 5,
+    "total_gross_volume_usd": 141353728.0104332,
+    "months_flagged_over_5pct_variance": 53,
+    "pct_month_asset_rows_flagged": 0.7571
+  },
+  "tax": {
+    "clients_processed": 250,
+    "realized_lots": 2723,
+    "wash_sale_flagged_lots": 655,
+    "total_net_gain_loss_usd": 366948.2819,
+    "total_estimated_tax_liability_usd": 351569.853338,
+    "total_disallowed_wash_sale_loss_usd": 543508.1963
+  },
+  "aml": {
+    "precision": 0.6762,
+    "recall": 0.7058,
+    "f1": 0.6907,
+    "roc_auc": 0.9902,
+    "n_flagged": 596,
+    "n_ground_truth_anomalies": 571
+  },
+  "workflow": {
+    "total_cases_opened": 596,
+    "escalated_to_compliance": 109,
+    "cleared": 487,
+    "sla_breaches": 0,
+    "avg_cycle_time_hours": 15.76,
+    "reviewer_caseload": {
+      "R. Castillo": 135,
+      "J. Okafor": 124,
+      "A. Menon": 117,
+      "S. Iyer": 111,
+      "T. Nakamura": 109
+    }
+  },
+  "_meta": {
+    "pipeline_runtime_seconds": 41.1
+  }
+}

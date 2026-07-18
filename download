@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Regenerable raw/intermediate data (run data/generate_data.py to recreate)
+data/*.csv
+data/*.txt
+data/*.parquet
+data/*.db
+data/silver_transactions/
+
+# outputs/*.csv, outputs/metrics.json, and dashboard/dashboard.html are
+# committed on purpose so the repo shows real results without a full run.
+
+.DS_Store
+.ipynb_checkpoints/
