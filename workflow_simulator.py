@@ -1,102 +1,94 @@
 """
-aml_anomaly_model.py
-----------------------
-Unsupervised anomaly detection over the cleaned transaction warehouse using
-an Isolation Forest, aimed at surfacing trades that look like potential
-AML risk or reporting inconsistencies (unusual size, off-market pricing,
-or bursty client activity).
+workflow_simulator.py
+------------------------
+NOTE ON SCOPE: Appian is a licensed, proprietary low-code BPM platform. This
+module is an open-source stand-in that reproduces the *case-management
+pattern* an Appian application would implement - a defined state machine,
+SLA timers, and an auditable case log - so the pipeline is runnable end to
+end without an enterprise license. If you have real Appian access, replace
+this with an Appian process model that consumes the same input file
+(outputs/aml_flagged_transactions.csv) via its integration connector.
 
-Because real AML labels don't exist for this synthetic dataset, generate_data.py
-seeds a small, known set of injected anomalies (`_seeded_anomaly` - oversized /
-mispriced trades) purely so this script can report precision/recall against a
-ground truth. In production there are no seeded labels; the model would be
-validated against investigator feedback (confirmed/dismissed alerts) instead.
+States: DETECTED -> ASSIGNED -> UNDER_REVIEW -> {ESCALATED | CLEARED}
+Each case gets a synthetic reviewer, an SLA deadline, and a resolution based
+on how anomalous it is (higher anomaly_score -> more likely escalated).
 """
-import sqlite3
+import random
+from dataclasses import dataclass, field
+from datetime import timedelta
 
-import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
+
+REVIEWERS = ["A. Menon", "R. Castillo", "J. Okafor", "S. Iyer", "T. Nakamura"]
+SLA_HOURS = {"DETECTED": 1, "ASSIGNED": 4, "UNDER_REVIEW": 24}
 
 
-FEATURES = ["quantity", "price_usd", "notional_usd", "z_qty", "z_price", "client_trade_count_7d"]
+@dataclass
+class Case:
+    case_id: str
+    event_id: str
+    anomaly_score: float
+    state: str = "DETECTED"
+    reviewer: str = None
+    history: list = field(default_factory=list)
 
 
-def load_ledger_with_ground_truth(sqlite_path: str, raw_ledger_path: str) -> pd.DataFrame:
-    conn = sqlite3.connect(sqlite_path)
-    txns = pd.read_sql("SELECT * FROM transactions WHERE source='blockchain_ledger'", conn)
-    conn.close()
-
-    ground_truth = pd.read_csv(raw_ledger_path)[["event_id", "seeded_anomaly"]]
-    df = txns.merge(ground_truth, on="event_id", how="left")
+def run_workflow(flagged_csv: str, seed: int = 7) -> pd.DataFrame:
+    random.seed(seed)
+    df = pd.read_csv(flagged_csv)
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
-    return df.dropna(subset=["timestamp"])
+
+    cases = []
+    for i, row in df.iterrows():
+        case = Case(case_id=f"CASE-{i:05d}", event_id=row["event_id"], anomaly_score=row["anomaly_score"])
+        t0 = row["timestamp"] if pd.notna(row["timestamp"]) else pd.Timestamp("2025-01-01")
+        case.history.append(("DETECTED", t0))
+
+        assign_t = t0 + timedelta(hours=random.uniform(0.2, SLA_HOURS["DETECTED"]))
+        case.reviewer = random.choice(REVIEWERS)
+        case.history.append(("ASSIGNED", assign_t))
+
+        review_t = assign_t + timedelta(hours=random.uniform(0.5, SLA_HOURS["ASSIGNED"]))
+        case.history.append(("UNDER_REVIEW", review_t))
+
+        # higher anomaly score -> higher chance of escalation to compliance
+        escalate_prob = min(0.15 + case.anomaly_score * 0.6, 0.9)
+        resolved_t = review_t + timedelta(hours=random.uniform(1, SLA_HOURS["UNDER_REVIEW"]))
+        final_state = "ESCALATED" if random.random() < escalate_prob else "CLEARED"
+        case.history.append((final_state, resolved_t))
+        case.state = final_state
+
+        cases.append(case)
+
+    rows = []
+    for c in cases:
+        total_cycle_hours = (c.history[-1][1] - c.history[0][1]).total_seconds() / 3600
+        rows.append(
+            {
+                "case_id": c.case_id,
+                "event_id": c.event_id,
+                "reviewer": c.reviewer,
+                "final_state": c.state,
+                "anomaly_score": c.anomaly_score,
+                "cycle_time_hours": round(total_cycle_hours, 2),
+                "sla_breached": total_cycle_hours > sum(SLA_HOURS.values()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values("timestamp").copy()
-    df["z_qty"] = df.groupby("symbol")["quantity"].transform(lambda s: (s - s.mean()) / (s.std() + 1e-9))
-    df["z_price"] = df.groupby("symbol")["price_usd"].transform(lambda s: (s - s.mean()) / (s.std() + 1e-9))
-
-    # rolling 7-day trade count per counterparty - proxy for "bursty" activity
-    df = df.set_index("timestamp")
-    counts = (
-        df.groupby("counterparty")["event_id"]
-        .rolling("7D")
-        .count()
-        .reset_index(level=0, drop=True)
-    )
-    df["client_trade_count_7d"] = counts
-    df = df.reset_index()
-    df["client_trade_count_7d"] = df["client_trade_count_7d"].fillna(1)
-    return df
-
-
-def train_and_score(df: pd.DataFrame, contamination: float = 0.012):
-    X = df[FEATURES].fillna(0).values
-    model = IsolationForest(
-        n_estimators=300, contamination=contamination, random_state=42, n_jobs=-1
-    )
-    model.fit(X)
-    # decision_function: higher = more normal. Flip sign so higher = more anomalous.
-    df = df.copy()
-    df["anomaly_score"] = -model.decision_function(X)
-    df["flagged"] = model.predict(X) == -1
-    return df, model
-
-
-def evaluate(df: pd.DataFrame) -> dict:
-    y_true = df["seeded_anomaly"].fillna(0).astype(int)
-    y_pred = df["flagged"].astype(int)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
-    try:
-        auc = roc_auc_score(y_true, df["anomaly_score"])
-    except ValueError:
-        auc = float("nan")
+def run(flagged_csv: str) -> dict:
+    cases = run_workflow(flagged_csv)
+    cases.to_csv("outputs/appian_case_log.csv", index=False)
     return {
-        "precision": round(precision, 4),
-        "recall": round(recall, 4),
-        "f1": round(f1, 4),
-        "roc_auc": round(auc, 4),
-        "n_flagged": int(df["flagged"].sum()),
-        "n_ground_truth_anomalies": int(y_true.sum()),
+        "total_cases_opened": len(cases),
+        "escalated_to_compliance": int((cases["final_state"] == "ESCALATED").sum()),
+        "cleared": int((cases["final_state"] == "CLEARED").sum()),
+        "sla_breaches": int(cases["sla_breached"].sum()),
+        "avg_cycle_time_hours": round(float(cases["cycle_time_hours"].mean()), 2),
+        "reviewer_caseload": cases["reviewer"].value_counts().to_dict(),
     }
 
 
-def run(sqlite_path: str, raw_ledger_path: str) -> dict:
-    df = load_ledger_with_ground_truth(sqlite_path, raw_ledger_path)
-    df = engineer_features(df)
-    scored, _ = train_and_score(df)
-    metrics = evaluate(scored)
-
-    flagged = scored[scored["flagged"]].sort_values("anomaly_score", ascending=False)
-    flagged[
-        ["event_id", "timestamp", "symbol", "quantity", "price_usd", "notional_usd", "anomaly_score", "seeded_anomaly"]
-    ].to_csv("outputs/aml_flagged_transactions.csv", index=False)
-
-    return metrics
-
-
 if __name__ == "__main__":
-    print(run("data/warehouse.db", "data/blockchain_ledger_raw.csv"))
+    print(run("outputs/aml_flagged_transactions.csv"))

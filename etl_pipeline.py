@@ -1,100 +1,93 @@
 """
-financial_model.py
---------------------
-FP&A layer: turns the cleaned transaction warehouse into monthly flash
-results per tokenized asset class, plus a budget-vs-actual variance view
-(the "budget" is a simple prior-month-trend forecast, standing in for the
-bank's official planning figures - swap `build_budget()` for a real feed
-from the planning system).
+etl_pipeline.py
+----------------
+PySpark ETL that takes the normalized output of xceptor_extractor.py and
+loads it into a centralized SQL warehouse (SQLite standing in for the bank's
+Snowflake/SQL Server instance - swap the JDBC url in load_to_sql() for a real
+target). Runs as a local Spark session so it is fully reproducible on a
+laptop; in production this would run on a YARN/Kubernetes cluster on a daily
+schedule (see the `schedule` block in README.md for the Airflow-equivalent cron).
+
+Steps: dedupe -> type/quality checks -> currency/quantity normalization ->
+partitioned parquet (silver layer) -> SQL load (gold layer).
 """
+import os
 import sqlite3
+import sys
 
-import numpy as np
-import pandas as pd
+os.environ.setdefault("JAVA_HOME", "/usr/lib/jvm/java-21-openjdk-amd64")
 
-
-# reference/master-data table: neither raw feed carries asset_class, so it is
-# resolved via a symbol lookup - a standard "conform to reference data" ETL step
-SYMBOL_ASSET_CLASS = {
-    "TBOND-24": "tokenized_treasury",
-    "TREIT-A": "tokenized_reit",
-    "TEQ-MSFT": "tokenized_equity",
-    "TEQ-NVDA": "tokenized_equity",
-    "TCORP-HY": "tokenized_corp_bond",
-    "TCASH-USD": "tokenized_money_market",
-}
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import DoubleType, TimestampType
 
 
-def load_transactions(sqlite_path: str) -> pd.DataFrame:
-    conn = sqlite3.connect(sqlite_path)
-    df = pd.read_sql("SELECT * FROM transactions", conn)
-    conn.close()
-    df["trade_month"] = df["trade_month"].astype(str)
-    df["asset_class"] = df["symbol"].map(SYMBOL_ASSET_CLASS).fillna("unclassified")
-    return df
-
-
-def monthly_flash_results(df: pd.DataFrame) -> pd.DataFrame:
-    """Realized flash P&L proxy: net notional flow signed by side, by month/asset class."""
-    signed = np.where(df["side"] == "SELL", df["notional_usd"], -df["notional_usd"])
-    df = df.assign(signed_notional=signed)
-    flash = (
-        df.groupby(["trade_month", "asset_class"], dropna=False)
-        .agg(
-            gross_volume_usd=("notional_usd", "sum"),
-            net_flow_usd=("signed_notional", "sum"),
-            trade_count=("event_id", "count"),
-            avg_ticket_usd=("notional_usd", "mean"),
-        )
-        .reset_index()
-        .sort_values(["asset_class", "trade_month"])
+def get_spark():
+    return (
+        SparkSession.builder.master("local[*]")
+        .appName("tokenized-asset-etl")
+        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.driver.memory", "2g")
+        .getOrCreate()
     )
-    return flash
 
 
-def build_budget(flash: pd.DataFrame) -> pd.DataFrame:
-    """Naive planning proxy: each month's budget = trailing 3-month average
-    *gross volume* per asset class, grown 2% (a stand-in for the bank's
-    actual annual operating plan figures). Gross volume is used as the
-    variance base rather than net flow, since net flow crosses zero for a
-    balanced book and produces meaningless percentage swings."""
-    out = []
-    for ac, g in flash.groupby("asset_class"):
-        g = g.sort_values("trade_month").reset_index(drop=True)
-        budget = (
-            g["gross_volume_usd"].rolling(3, min_periods=1).mean().shift(1).fillna(g["gross_volume_usd"].iloc[0])
-            * 1.02
-        )
-        g = g.assign(budget_gross_volume_usd=budget)
-        out.append(g)
-    return pd.concat(out, ignore_index=True)
+def run_etl(input_parquet: str, sqlite_path: str):
+    spark = get_spark()
+    spark.sparkContext.setLogLevel("ERROR")
 
+    df = spark.read.parquet(input_parquet)
+    n_raw = df.count()
 
-def variance_report(flash_with_budget: pd.DataFrame) -> pd.DataFrame:
-    df = flash_with_budget.copy()
-    df["variance_usd"] = df["gross_volume_usd"] - df["budget_gross_volume_usd"]
-    df["variance_pct"] = (df["variance_usd"] / df["budget_gross_volume_usd"].replace(0, np.nan)).abs()
-    df["variance_flag"] = df["variance_pct"] > 0.05  # >5% triggers Appian variance-justification workflow
-    return df
+    # --- data quality gate ---------------------------------------------
+    before = df.count()
+    df = df.dropDuplicates(["source", "event_id"])
+    n_dupes = before - df.count()
 
+    df = df.withColumn("quantity", F.col("quantity").cast(DoubleType()))
+    df = df.withColumn("price_usd", F.col("price_usd").cast(DoubleType()))
+    df = df.withColumn("timestamp", F.to_timestamp("timestamp"))
 
-def run(sqlite_path: str) -> dict:
-    txns = load_transactions(sqlite_path)
-    flash = monthly_flash_results(txns)
-    with_budget = build_budget(flash)
-    variance = variance_report(with_budget)
+    quality_before = df.count()
+    df_clean = df.filter(
+        (F.col("quantity").isNotNull())
+        & (F.col("quantity") > 0)
+        & (F.col("price_usd").isNotNull())
+        & (F.col("price_usd") > 0)
+        & (F.col("timestamp").isNotNull())
+    )
+    n_rejected = quality_before - df_clean.count()
 
-    variance.to_csv("outputs/flash_variance_report.csv", index=False)
+    df_clean = df_clean.withColumn("notional_usd", F.col("quantity") * F.col("price_usd"))
+    df_clean = df_clean.withColumn("trade_date", F.to_date("timestamp"))
+    df_clean = df_clean.withColumn("trade_month", F.date_format("timestamp", "yyyy-MM"))
 
-    summary = {
-        "months_covered": int(variance["trade_month"].nunique()),
-        "asset_classes": int(variance["asset_class"].nunique()),
-        "total_gross_volume_usd": float(flash["gross_volume_usd"].sum()),
-        "months_flagged_over_5pct_variance": int(variance["variance_flag"].sum()),
-        "pct_month_asset_rows_flagged": round(float(variance["variance_flag"].mean()), 4),
+    # --- silver layer: partitioned parquet ------------------------------
+    silver_path = "data/silver_transactions"
+    df_clean.write.mode("overwrite").partitionBy("trade_month").parquet(silver_path)
+
+    # --- gold layer: load into centralized SQL --------------------------
+    pdf = df_clean.toPandas()
+    conn = sqlite3.connect(sqlite_path)
+    pdf.to_sql("transactions", conn, if_exists="replace", index=False)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_txn_month ON transactions(trade_month)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_txn_symbol ON transactions(symbol)")
+    conn.commit()
+    conn.close()
+
+    report = {
+        "rows_ingested": n_raw,
+        "duplicate_rows_dropped": int(n_dupes),
+        "rows_rejected_quality_gate": int(n_rejected),
+        "rows_loaded_gold": int(len(pdf)),
+        "data_quality_pass_rate": round(len(pdf) / n_raw, 4),
+        "silver_path": silver_path,
+        "gold_sql_path": sqlite_path,
     }
-    return summary
+    spark.stop()
+    return report
 
 
 if __name__ == "__main__":
-    print(run("data/warehouse.db"))
+    result = run_etl("data/normalized_transactions.parquet", "data/warehouse.db")
+    for k, v in result.items():
+        print(f"{k}: {v}")
